@@ -19,7 +19,7 @@ function createDeck() {
   let deck = [];
   for (let suit of SUITS) {
     for (let rank of RANKS) {
-      deck.push({ rank, suit, id: rank + suit });
+      deck.push({ rank, suit, id: rank + suit + Math.random() }); // Уникальный ID для каждой карты
     }
   }
   return deck.sort(() => Math.random() - 0.5);
@@ -61,6 +61,19 @@ function refillHands(room) {
   });
 }
 
+function checkGameStatus(room, roomId) {
+  if (room.deck.length === 0) {
+    let activePlayers = room.players.filter(p => p.hand.length > 0);
+    if (activePlayers.length === 1) {
+      room.status = 'ended';
+      room.durak = activePlayers[0].id;
+    } else if (activePlayers.length === 0) {
+      room.status = 'ended';
+      room.durak = 'Ничья';
+    }
+  }
+}
+
 io.on('connection', (socket) => {
   socket.on('joinRoom', ({ roomId, maxPlayers, tgName, tgPhoto }) => {
     socket.join(roomId);
@@ -69,7 +82,7 @@ io.on('connection', (socket) => {
       let trumpCard = deck[deck.length - 1];
       rooms[roomId] = {
         id: roomId, maxPlayers: parseInt(maxPlayers) || 2, players: [],
-        table: [], deck: deck, trump: trumpCard.suit,
+        table: [], deck: deck, trump: trumpCard.suit, trumpCard: trumpCard,
         turn: null, defender: null, status: 'waiting', durak: null
       };
     }
@@ -86,15 +99,41 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('gameState', room);
   });
 
+  // Логика перезапуска игры
+  socket.on('restartGame', ({ roomId }) => {
+    let room = rooms[roomId];
+    if (!room || room.status !== 'ended') return;
+
+    room.deck = createDeck();
+    room.trumpCard = room.deck[room.deck.length - 1];
+    room.trump = room.trumpCard.suit;
+    room.table = [];
+    room.status = 'playing';
+    room.durak = null;
+
+    room.players.forEach(p => p.hand = room.deck.splice(0, 6));
+    room.turn = determineFirstTurn(room);
+    room.defender = getNextPlayer(room, room.turn);
+
+    io.to(roomId).emit('gameState', room);
+  });
+
   socket.on('attackCard', ({ roomId, card }) => {
     let room = rooms[roomId];
     if (!room || room.status !== 'playing' || room.turn !== socket.id) return;
     let player = room.players.find(p => p.id === socket.id);
+    
     if (room.table.length > 0) {
       let allowed = [];
       room.table.forEach(p => { allowed.push(p.attack.rank); if(p.defense) allowed.push(p.defense.rank); });
       if (!allowed.includes(card.rank)) return;
     }
+    
+    // Проверка, чтобы не подкинуть больше карт, чем у защищающегося
+    let defenderPlayer = room.players.find(p => p.id === room.defender);
+    let unbeatCount = room.table.filter(pair => !pair.defense).length;
+    if (unbeatCount >= defenderPlayer.hand.length && room.table.length > 0) return;
+
     player.hand = player.hand.filter(c => c.id !== card.id);
     room.table.push({ attack: card, defense: null });
     io.to(roomId).emit('gameState', room);
@@ -102,11 +141,14 @@ io.on('connection', (socket) => {
 
   socket.on('defendCard', ({ roomId, cardId, withCard }) => {
     let room = rooms[roomId];
-    if (!room || room.defender !== socket.id) return;
+    if (!room || room.status !== 'playing' || room.defender !== socket.id) return;
     let player = room.players.find(p => p.id === socket.id);
     let pair = room.table.find(p => p.attack.id === cardId && !p.defense);
     if (!player || !pair) return;
-    let isLegal = (withCard.suit === pair.attack.suit && CARD_VALUES[withCard.rank] > CARD_VALUES[pair.attack.rank]) || (withCard.suit === room.trump);
+    
+    let isLegal = (withCard.suit === pair.attack.suit && CARD_VALUES[withCard.rank] > CARD_VALUES[pair.attack.rank]) || 
+                  (withCard.suit === room.trump && pair.attack.suit !== room.trump);
+    
     if (isLegal) {
       player.hand = player.hand.filter(c => c.id !== withCard.id);
       pair.defense = withCard;
@@ -116,23 +158,30 @@ io.on('connection', (socket) => {
 
   socket.on('action', ({ roomId, type }) => {
     let room = rooms[roomId];
-    if (!room) return;
+    if (!room || room.status !== 'playing') return;
+
     if (type === 'bito' && socket.id === room.turn) {
       if (room.table.length === 0 || !room.table.every(p => p.defense)) return;
       room.table = [];
       refillHands(room);
-      room.turn = room.defender;
-      room.defender = getNextPlayer(room, room.turn);
+      checkGameStatus(room, roomId);
+      if (room.status === 'playing') {
+        room.turn = room.defender;
+        room.defender = getNextPlayer(room, room.turn);
+      }
     } else if (type === 'take' && socket.id === room.defender) {
       let p = room.players.find(p => p.id === socket.id);
       room.table.forEach(pair => { p.hand.push(pair.attack); if(pair.defense) p.hand.push(pair.defense); });
       room.table = [];
       refillHands(room);
-      room.turn = getNextPlayer(room, room.defender);
-      room.defender = getNextPlayer(room, room.turn);
+      checkGameStatus(room, roomId);
+      if (room.status === 'playing') {
+        room.turn = getNextPlayer(room, room.defender);
+        room.defender = getNextPlayer(room, room.turn);
+      }
     }
     io.to(roomId).emit('gameState', room);
   });
 });
 
-server.listen(3000, () => console.log('Сервер готов к работе!'));
+server.listen(3000, () => console.log('Сервер готов!'));
